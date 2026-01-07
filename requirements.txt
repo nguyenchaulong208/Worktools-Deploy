@@ -1,0 +1,6 @@
+# Các thư viện chính/Gói cài đặt cho Excel Tool
+streamlit
+pandas
+openpyxl
+setuptools
+xlrd
