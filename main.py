@@ -14,21 +14,6 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 TIME_FORMAT = "%Y-%m-%d %H:%M"
 EVENTS_FILE = "events.json"
 
-# events = {
-#   event_id: {
-#       "title": str,
-#       "description": str,
-#       "time": datetime,
-#       "remind_type": "none" | "daily" | "weekly" | "before",
-#       "remind_value": int | None,   # phút trước khi bắt đầu (cho before)
-#       "next_remind": datetime | None,
-#       "users": set[int],
-#       "ticket_msg": int | None,
-#       "remind_channel_id": int,
-#       "reminded": bool,
-#       "canceled": bool
-#   }
-# }
 events: dict[int, dict] = {}
 event_counter = 1
 
@@ -97,10 +82,10 @@ def save_events():
 
 
 # ==========================
-# HELPER FUNCTIONS
+# FIXED: REMIND LOGIC
 # ==========================
 def compute_next_remind(ev: dict) -> datetime | None:
-    """Tính next_remind dựa trên time + remind_type."""
+    now = datetime.now()
     start = ev["time"]
     rtype = ev["remind_type"]
     rval = ev["remind_value"]
@@ -108,31 +93,36 @@ def compute_next_remind(ev: dict) -> datetime | None:
     if ev["canceled"]:
         return None
 
+    # --- NONE ---
     if rtype == "none":
-        # nhắc đúng giờ bắt đầu, 1 lần
-        return start if not ev["reminded"] else None
+        if ev["reminded"]:
+            return None
+        if start <= now:
+            return None
+        return start
 
+    # --- BEFORE ---
     if rtype == "before":
-        if rval is None:
+        if ev["reminded"]:
             return None
         remind_time = start - timedelta(minutes=rval)
-        return remind_time if not ev["reminded"] else None
+        if remind_time <= now:
+            return None
+        return remind_time
 
+    # --- DAILY ---
     if rtype == "daily":
-        # nhắc mỗi ngày vào giờ start, bắt đầu từ lần gần nhất >= now
-        now = datetime.now()
         base = start.replace(year=now.year, month=now.month, day=now.day)
-        if base < now:
+        if base <= now:
             base += timedelta(days=1)
         return base
 
+    # --- WEEKLY ---
     if rtype == "weekly":
-        # nhắc mỗi tuần vào cùng weekday + giờ
-        now = datetime.now()
         base = start.replace(year=now.year, month=now.month, day=now.day)
         diff = (start.weekday() - base.weekday()) % 7
-        base = base + timedelta(days=diff)
-        if base < now:
+        base += timedelta(days=diff)
+        if base <= now:
             base += timedelta(weeks=1)
         return base
 
@@ -144,37 +134,32 @@ async def send_event_reminder(event_id: int):
     channel = bot.get_channel(ev["remind_channel_id"])
     if not channel:
         return
-    if ev["canceled"]:
-        return
 
     if not ev["users"]:
-        await channel.send(
-            f"⏰ Event **#{event_id} — {ev['title']}** đến giờ nhưng chưa có ai đăng ký."
-        )
+        await channel.send(f"⏰ Event **#{event_id} — {ev['title']}** đến giờ nhưng chưa có ai đăng ký.")
     else:
         mentions = " ".join([f"<@{uid}>" for uid in ev["users"]])
         await channel.send(
             f"⏰ **REMIND EVENT #{event_id} — {ev['title']}**\n"
             f"{mentions}\n"
-            f"🕒 Thời gian: {ev['time'].strftime(TIME_FORMAT)}\n"
+            f"🕒 {ev['time'].strftime(TIME_FORMAT)}\n"
             f"📄 {ev['description']}"
         )
 
 
-async def create_ticket_message(ev_id: int) -> None:
-    """Tạo ticket mới theo dữ liệu event hiện tại, xóa ticket cũ nếu có."""
+async def create_ticket_message(ev_id: int):
     ev = events[ev_id]
     channel = bot.get_channel(ev["remind_channel_id"])
     if not channel:
         return
 
-    # Xóa ticket cũ nếu có
+    # Xóa ticket cũ
     if ev["ticket_msg"]:
         try:
-            old_msg = await channel.fetch_message(ev["ticket_msg"])
-            await old_msg.delete()
-        except Exception:
-            pass  # có thể ticket cũ ở kênh khác hoặc đã bị xóa
+            old = await channel.fetch_message(ev["ticket_msg"])
+            await old.delete()
+        except:
+            pass
 
     embed = discord.Embed(
         title=f"🎫 Đăng ký Event #{ev_id} — {ev['title']}",
@@ -192,8 +177,9 @@ async def create_ticket_message(ev_id: int) -> None:
         rtext = "Nhắc hàng tuần"
     else:
         rtext = f"Nhắc trước {ev['remind_value']} phút"
+
     embed.add_field(name="🔔 Remind", value=rtext, inline=False)
-    embed.set_footer(text="React 👍 để đăng ký tham gia")
+    embed.set_footer(text="React 👍 để đăng ký")
 
     msg = await channel.send(embed=embed)
     await msg.add_reaction("👍")
@@ -203,17 +189,16 @@ async def create_ticket_message(ev_id: int) -> None:
 
 
 # ==========================
-# BACKGROUND TASK
+# BACKGROUND REMIND LOOP
 # ==========================
 @tasks.loop(seconds=30)
 async def event_checker():
     now = datetime.now()
     for event_id, ev in list(events.items()):
-        if ev["canceled"]:
-            continue
         nr = ev["next_remind"]
-        if nr is None:
+        if not nr or ev["canceled"]:
             continue
+
         if now >= nr:
             await send_event_reminder(event_id)
 
@@ -233,12 +218,12 @@ async def event_checker():
 # ==========================
 @tree.command(name="create_event", description="Tạo event mới")
 @app_commands.describe(
-    title="Tiêu đề event",
-    description="Nội dung event",
-    start_time="Thời gian bắt đầu (YYYY-MM-DD HH:MM)",
-    remind_type="Kiểu nhắc: none/daily/weekly/before",
-    minutes_before="Số phút nhắc trước (chỉ dùng khi remind_type = before)",
-    remind_channel="Kênh sẽ gửi remind và ticket",
+    title="Tiêu đề",
+    description="Nội dung",
+    start_time="YYYY-MM-DD HH:MM",
+    remind_type="none/daily/weekly/before",
+    minutes_before="Phút nhắc trước (nếu dùng before)",
+    remind_channel="Kênh nhắc & ticket"
 )
 async def create_event(
     interaction: discord.Interaction,
@@ -250,34 +235,21 @@ async def create_event(
     minutes_before: int | None = None,
 ):
     global event_counter
-
     await interaction.response.defer(ephemeral=True)
 
     remind_type = remind_type.lower()
     if remind_type not in ("none", "daily", "weekly", "before"):
-        await interaction.followup.send(
-            "❌ remind_type phải là: `none` / `daily` / `weekly` / `before`",
-            ephemeral=True,
-        )
-        return
+        return await interaction.followup.send("❌ remind_type sai.", ephemeral=True)
 
-    if remind_type == "before" and (minutes_before is None or minutes_before <= 0):
-        await interaction.followup.send(
-            "❌ Với remind_type = `before`, bạn phải nhập `minutes_before > 0`.",
-            ephemeral=True,
-        )
-        return
+    if remind_type == "before" and (not minutes_before or minutes_before <= 0):
+        return await interaction.followup.send("❌ minutes_before phải > 0.", ephemeral=True)
 
     try:
         dt = datetime.strptime(start_time, TIME_FORMAT)
-    except ValueError:
-        await interaction.followup.send(
-            "❌ Sai định dạng thời gian. Dùng: `YYYY-MM-DD HH:MM`",
-            ephemeral=True,
-        )
-        return
+    except:
+        return await interaction.followup.send("❌ Sai định dạng thời gian.", ephemeral=True)
 
-    event_id = event_counter
+    eid = event_counter
     event_counter += 1
 
     ev = {
@@ -293,27 +265,28 @@ async def create_event(
         "reminded": False,
         "canceled": False,
     }
+
     ev["next_remind"] = compute_next_remind(ev)
-    events[event_id] = ev
+    events[eid] = ev
     save_events()
 
-    await create_ticket_message(event_id)
+    await create_ticket_message(eid)
 
     await interaction.followup.send(
-        f"✅ Đã tạo Event #{event_id} và ticket tại kênh {remind_channel.mention}.",
-        ephemeral=True,
+        f"✅ Event #{eid} đã tạo tại {remind_channel.mention}.",
+        ephemeral=True
     )
 
 
 @tree.command(name="edit_event", description="Chỉnh sửa event")
 @app_commands.describe(
-    event_id="ID của event",
-    title="Tiêu đề mới (bỏ trống nếu không đổi)",
-    description="Nội dung mới (bỏ trống nếu không đổi)",
-    start_time="Thời gian mới (YYYY-MM-DD HH:MM, bỏ trống nếu không đổi)",
-    remind_type="Kiểu nhắc mới: none/daily/weekly/before (bỏ trống nếu không đổi)",
-    minutes_before="Số phút nhắc trước (nếu dùng remind_type = before)",
-    remind_channel="Kênh remind/ticket mới (bỏ trống nếu không đổi)",
+    event_id="ID event",
+    title="Tiêu đề mới",
+    description="Nội dung mới",
+    start_time="YYYY-MM-DD HH:MM",
+    remind_type="none/daily/weekly/before",
+    minutes_before="Phút nhắc trước",
+    remind_channel="Kênh nhắc mới"
 )
 async def edit_event(
     interaction: discord.Interaction,
@@ -328,8 +301,7 @@ async def edit_event(
     await interaction.response.defer(ephemeral=True)
 
     if event_id not in events:
-        await interaction.followup.send("❌ Event không tồn tại.", ephemeral=True)
-        return
+        return await interaction.followup.send("❌ Event không tồn tại.", ephemeral=True)
 
     ev = events[event_id]
 
@@ -340,59 +312,45 @@ async def edit_event(
     if start_time:
         try:
             ev["time"] = datetime.strptime(start_time, TIME_FORMAT)
-        except ValueError:
-            await interaction.followup.send(
-                "❌ Sai định dạng thời gian. Dùng: `YYYY-MM-DD HH:MM`",
-                ephemeral=True,
-            )
-            return
+        except:
+            return await interaction.followup.send("❌ Sai thời gian.", ephemeral=True)
+
     if remind_type:
-        rtype = remind_type.lower()
-        if rtype not in ("none", "daily", "weekly", "before"):
-            await interaction.followup.send(
-                "❌ remind_type phải là: `none` / `daily` / `weekly` / `before`",
-                ephemeral=True,
-            )
-            return
-        ev["remind_type"] = rtype
-        if rtype == "before":
-            if minutes_before is None or minutes_before <= 0:
-                await interaction.followup.send(
-                    "❌ Với remind_type = `before`, bạn phải nhập `minutes_before > 0`.",
-                    ephemeral=True,
-                )
-                return
+        r = remind_type.lower()
+        if r not in ("none", "daily", "weekly", "before"):
+            return await interaction.followup.send("❌ remind_type sai.", ephemeral=True)
+        ev["remind_type"] = r
+        if r == "before":
+            if not minutes_before or minutes_before <= 0:
+                return await interaction.followup.send("❌ minutes_before sai.", ephemeral=True)
             ev["remind_value"] = minutes_before
         else:
             ev["remind_value"] = None
+
     if remind_channel:
         ev["remind_channel_id"] = remind_channel.id
 
-    # reset remind & tính lại next_remind
     ev["reminded"] = False
     ev["next_remind"] = compute_next_remind(ev)
     save_events()
 
-    # tạo lại ticket theo dữ liệu mới (xóa ticket cũ, gửi ticket mới)
     await create_ticket_message(event_id)
 
     await interaction.followup.send(
-        f"✏️ Đã chỉnh sửa Event #{event_id} và cập nhật ticket theo dữ liệu mới.",
-        ephemeral=True,
+        f"✏️ Event #{event_id} đã cập nhật.",
+        ephemeral=True
     )
 
 
-@tree.command(name="list_events", description="Liệt kê tất cả event")
+@tree.command(name="list_events", description="Danh sách event")
 async def list_events(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     if not events:
-        await interaction.followup.send("Chưa có event nào.", ephemeral=True)
-        return
+        return await interaction.followup.send("Không có event.", ephemeral=True)
 
-    lines = []
+    msg = ""
     for eid, ev in events.items():
-        status = "✅" if not ev["canceled"] else "❌ CANCELED"
         rtype = ev["remind_type"]
         if rtype == "none":
             rtext = "Không nhắc"
@@ -403,126 +361,110 @@ async def list_events(interaction: discord.Interaction):
         else:
             rtext = f"Nhắc trước {ev['remind_value']} phút"
 
-        lines.append(
+        msg += (
             f"**#{eid} — {ev['title']}**\n"
-            f"📄 {ev['description']}\n"
             f"🕒 {ev['time'].strftime(TIME_FORMAT)}\n"
             f"🔔 {rtext}\n"
-            f"📢 Remind & Ticket: <#{ev['remind_channel_id']}> | {status}\n"
+            f"📢 Kênh: <#{ev['remind_channel_id']}>\n\n"
         )
 
-    await interaction.followup.send("\n".join(lines), ephemeral=True)
+    await interaction.followup.send(msg, ephemeral=True)
 
 
-@tree.command(name="list_member", description="Xem danh sách người đăng ký event")
-@app_commands.describe(event_id="ID của event")
+@tree.command(name="list_member", description="Danh sách đăng ký")
 async def list_member(interaction: discord.Interaction, event_id: int):
     await interaction.response.defer(ephemeral=True)
 
     if event_id not in events:
-        await interaction.followup.send("❌ Event không tồn tại.", ephemeral=True)
-        return
+        return await interaction.followup.send("❌ Event không tồn tại.", ephemeral=True)
 
     ev = events[event_id]
     if not ev["users"]:
-        await interaction.followup.send("Chưa có ai đăng ký.", ephemeral=True)
-        return
+        return await interaction.followup.send("Chưa ai đăng ký.", ephemeral=True)
 
-    lines = []
-    for uid in ev["users"]:
-        user = await bot.fetch_user(uid)
-        lines.append(f"- {user.mention}")
-
-    await interaction.followup.send(
-        f"**Danh sách đăng ký Event #{event_id} — {ev['title']}:**\n" + "\n".join(lines),
-        ephemeral=True,
-    )
+    msg = "\n".join([f"- <@{uid}>" for uid in ev["users"]])
+    await interaction.followup.send(msg, ephemeral=True)
 
 
-@tree.command(name="cancel_event", description="Hủy event (không remind nữa, nhưng giữ lại)")
-@app_commands.describe(event_id="ID của event")
+@tree.command(name="cancel_event", description="Hủy event")
 async def cancel_event(interaction: discord.Interaction, event_id: int):
     await interaction.response.defer(ephemeral=True)
 
     if event_id not in events:
-        await interaction.followup.send("❌ Event không tồn tại.", ephemeral=True)
-        return
+        return await interaction.followup.send("❌ Event không tồn tại.", ephemeral=True)
 
     ev = events[event_id]
     ev["canceled"] = True
     ev["next_remind"] = None
     save_events()
 
-    await interaction.followup.send(f"❌ Event #{event_id} đã bị hủy.", ephemeral=True)
+    await interaction.followup.send(f"❌ Event #{event_id} đã hủy.", ephemeral=True)
 
 
-@tree.command(name="delete_event", description="Xóa hoàn toàn event")
-@app_commands.describe(event_id="ID của event")
+@tree.command(name="delete_event", description="Xóa event")
 async def delete_event(interaction: discord.Interaction, event_id: int):
     await interaction.response.defer(ephemeral=True)
 
     if event_id not in events:
-        await interaction.followup.send("❌ Event không tồn tại.", ephemeral=True)
-        return
+        return await interaction.followup.send("❌ Event không tồn tại.", ephemeral=True)
 
     ev = events[event_id]
-    # cố gắng xóa ticket nếu còn
     channel = bot.get_channel(ev["remind_channel_id"])
     if channel and ev["ticket_msg"]:
         try:
             msg = await channel.fetch_message(ev["ticket_msg"])
             await msg.delete()
-        except Exception:
+        except:
             pass
 
     del events[event_id]
     save_events()
 
-    await interaction.followup.send(f"🗑️ Event #{event_id} đã bị xóa.", ephemeral=True)
+    await interaction.followup.send(f"🗑️ Event #{event_id} đã xóa.", ephemeral=True)
 
 
 # ==========================
 # REACTION HANDLERS
 # ==========================
 @bot.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+async def on_raw_reaction_add(payload):
     if payload.user_id == bot.user.id:
         return
-    for event_id, ev in events.items():
+    for eid, ev in events.items():
         if ev["ticket_msg"] == payload.message_id and str(payload.emoji) == "👍":
             ev["users"].add(payload.user_id)
             save_events()
 
 
 @bot.event
-async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    for event_id, ev in events.items():
+async def on_raw_reaction_remove(payload):
+    for eid, ev in events.items():
         if ev["ticket_msg"] == payload.message_id and str(payload.emoji) == "👍":
             ev["users"].discard(payload.user_id)
             save_events()
 
 
 # ==========================
-# EVENTS
+# BOT READY
 # ==========================
 @bot.event
 async def on_ready():
     print(f"Bot đã đăng nhập: {bot.user}")
+
     load_events()
-    # đảm bảo next_remind luôn đúng sau khi restart
+
     for ev in events.values():
         ev["next_remind"] = compute_next_remind(ev)
     save_events()
+
     event_checker.start()
-    try:
-        await tree.sync()
-        print("Đã sync slash commands.")
-    except Exception as e:
-        print("Lỗi sync commands:", e)
+
+    await tree.sync()
+    print("Slash commands synced.")
 
 
 # ==========================
-# FLASK KEEP-ALIVE (Render)
+# FLASK KEEP-ALIVE
 # ==========================
 app = Flask(__name__)
 
@@ -538,6 +480,5 @@ def run_flask():
 # START BOT
 # ==========================
 if __name__ == "__main__":
-    load_events()
     threading.Thread(target=run_flask).start()
     bot.run(TOKEN)
