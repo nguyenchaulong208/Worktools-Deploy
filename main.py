@@ -82,7 +82,7 @@ def save_events():
 
 
 # ==========================
-# FIXED: REMIND LOGIC
+# FIXED REMIND LOGIC
 # ==========================
 def compute_next_remind(ev: dict) -> datetime | None:
     now = datetime.now()
@@ -93,7 +93,7 @@ def compute_next_remind(ev: dict) -> datetime | None:
     if ev["canceled"]:
         return None
 
-    # --- NONE ---
+    # NONE → chỉ nhắc đúng giờ, không nhắc lại
     if rtype == "none":
         if ev["reminded"]:
             return None
@@ -101,7 +101,7 @@ def compute_next_remind(ev: dict) -> datetime | None:
             return None
         return start
 
-    # --- BEFORE ---
+    # BEFORE → nhắc trước X phút
     if rtype == "before":
         if ev["reminded"]:
             return None
@@ -110,20 +110,20 @@ def compute_next_remind(ev: dict) -> datetime | None:
             return None
         return remind_time
 
-    # --- DAILY ---
+    # DAILY → nếu giờ hôm nay đã qua → nhắc NGAY LẬP TỨC
     if rtype == "daily":
         base = start.replace(year=now.year, month=now.month, day=now.day)
         if base <= now:
-            base += timedelta(days=1)
+            return now + timedelta(seconds=5)
         return base
 
-    # --- WEEKLY ---
+    # WEEKLY → nếu giờ tuần này đã qua → nhắc NGAY LẬP TỨC
     if rtype == "weekly":
         base = start.replace(year=now.year, month=now.month, day=now.day)
         diff = (start.weekday() - base.weekday()) % 7
         base += timedelta(days=diff)
         if base <= now:
-            base += timedelta(weeks=1)
+            return now + timedelta(seconds=5)
         return base
 
     return None
@@ -206,9 +206,9 @@ async def event_checker():
                 ev["reminded"] = True
                 ev["next_remind"] = None
             elif ev["remind_type"] == "daily":
-                ev["next_remind"] = nr + timedelta(days=1)
+                ev["next_remind"] = now + timedelta(days=1)
             elif ev["remind_type"] == "weekly":
-                ev["next_remind"] = nr + timedelta(weeks=1)
+                ev["next_remind"] = now + timedelta(weeks=1)
 
             save_events()
 
